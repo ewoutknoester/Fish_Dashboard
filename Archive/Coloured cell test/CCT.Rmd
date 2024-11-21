@@ -1,0 +1,151 @@
+---
+title: "Excel colour fish to R"
+author: "Ewout Knoester"
+date: "17/03/2023"
+output: html_document
+---
+
+# Setup
+```{r setup}
+rm(list=ls()) # Clear workspace
+knitr::opts_knit$set(root.dir = '/tmp') #Set directory at current directory for all subsequent chunks
+options(scipen = 99) # Have all numbers in non-scientific notation
+options(java.parameters = "- Xmx1024m") # memory for java
+
+library(readxl) # Join data frames (vlookup)
+library(cowplot) # Combine plots
+library(data.table)
+library(ggthemes) # pretty plots
+library(flextable) # Layout word table
+library(tidyverse) # Beta regression
+library(vegan) # Export Excel
+library(gridExtra)
+library(emmeans) # Select text from string
+library(lmerTest) # GLS
+library(officer) # Move table into word
+library(gridGraphics) # Combine base and ggplots
+library(car) # glm model validation
+library(viridis) # Convert data from wide to long
+library(pairwiseAdonis)
+library(writexl) # Export Excel
+
+# Function to facilitate averaging data frame
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      n  = length(x[[col]]),
+      sd = sd(x[[col]], na.rm=TRUE),
+      sum  = sum(x[[col]]),
+      se = sd(x[[col]], na.rm=TRUE)/sqrt(length(x[[col]])))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- plyr::rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+```
+
+```{r data selection, warning= FALSE}
+
+# ---- RAW DATA ----
+
+library(tidyxl)
+###!!! SET EMPTY FISH ABUNDANCE CELLS TO ZERO IN EXCEL BEFORE LOADING
+
+# ---- RAW DATA ----
+# Get raw data and formats
+FishExcel <- xlsx_cells("Fish surveys_DATABASE_2023.xlsx") # Includes all sheets
+data_bothNI <- subset(FishExcel, sheet == "INPUT Sheet") # Subset input data sheet (still including both Non & Instantaneous data)
+format <- xlsx_formats("Fish surveys_DATABASE_2023.xlsx") # Formats of all sheets
+
+# Remove non-instantaneous data
+## Subset data  to identify coloured cells
+ColouredCells <- data_bothNI %>% 
+  filter(local_format_id %in% which(!is.na(format$local$fill$patternFill$fgColor$rgb))) %>%
+  select(address, row, col, data_type)
+
+## Replace counts in coloured cells with 0 (i.e. remove Non-instantaneous data)
+dataI <- data_bothNI %>% 
+  mutate(numeric = case_when(address %in% ColouredCells$address ~ 0, TRUE ~ numeric))
+
+## Tidy data
+dataI <- subset(dataI, row > 2) # Remove first two rows row (survey number & size classes)
+dataI <- select(dataI, c("row", "col", "character", "numeric")) # Remove unnecessary columns
+speciesList <- na.omit(dataI$character) # Save species list for later use
+dataI <- select(dataI, -c("character")) # Remove species column
+dataI <- subset(dataI, col > 1) # Remove species column values
+dataI$row <- dataI$row - 2 # Renumber rows to start at 1
+dataI$col <- dataI$col - 1 # Renumber columns to start at 1
+
+# To wide format
+dataI <- as.data.frame(dataI) # Go from tibble back to dataframe
+dataW <- reshape(dataI, idvar = c("row"), timevar = "col", direction = "wide") # To wide format
+
+## Set column names
+surveys.tot <- (ncol(dataW) - 1)/12
+colname <- c("Species", paste0(rep(c("c1_", "c2_", "c3_", "c4_", "c5_", "c6_", "c7_", "c8_", "c9_", "c10_", "c11num_", "c11size_"), surveys.tot), rep(1:surveys.tot, each = 12)))
+colnames(dataW) <- colname
+
+# To long format
+bio <- setDT(dataW)
+bio <- melt(bio, 
+            id.vars = 'Species', variable.name = 'SurveyNo', 
+            measure.vars = patterns('^c1_', '^c2_', '^c3_', '^c4_', '^c5_', '^c6_',
+                                    '^c7_', '^c8_', '^c9_', '^c10_', '^c11num_', '^c11size_'),
+            value.name = c('1.25', '3.75', '6.25', '8.75', '12.5', '17.5',
+                           '25', '35', '45', '75',  'Abundance_11', 'SizeClass_11'))
+
+## Get Size class from wide to long
+bio <- reshape2::melt(bio, id.vars = c('SurveyNo', 'Species', 'Abundance_11', 'SizeClass_11'), 
+          measure.vars = c('1.25', '3.75', '6.25', '8.75', '12.5', '17.5', '25', '35', '45', '75'),
+          variable.name = 'SizeClass', value.name = 'Abundance')
+
+# ---- META DATA ----
+## Survey metadata
+SurveysData <- as.data.frame(read_excel("Fish surveys_DATABASE_2023.xlsx", sheet = "Data")) 
+SurveysData <- SurveysData[!is.na(SurveysData$Date),] # Remove empty rows
+
+### Clean up
+colnames(SurveysData)[1] <- "SurveyNo" 
+SurveysData <- SurveysData[,c("SurveyNo", "Transect", "Observer", "Area")] # Remove unnecessary columns 
+
+## Species metadata
+specieslist <- as.data.frame(read_excel("Structural complexity_Fish species list_2022-08.xlsx"))
+
+# ---- MERGE ----
+# Add species info
+## Re-add species names in data frame
+bio$Species <- speciesList # Added based on original order (!)
+bio$Species <- sub("\\.", "", bio$Species) # Remove points from species names
+## Combine data and specieslist data frames
+bio <- merge(bio, specieslist, all.x=T, by='Species')
+
+## Cleanup
+bio$SizeClass <- as.numeric(paste(bio$SizeClass)) # Set a numeric Length
+
+# Add survey info
+bio <- merge(bio, SurveysData, all.x=T, by='SurveyNo')
+
+# Calculate biomass using the length-weight formula W = a * L^b, multiply per abundance and standardize to kg/ha
+## For small size classes:
+bio$Biomass_ha <- ((((bio$a * (bio$SizeClass ^ bio$b)) * bio$Abundance)/ bio$Area)/1000)* 10000
+## For large size class (>11):
+bio$Abundance_11 <- ifelse(bio$SizeClass == 1.25, bio$Abundance_11, 0) # Remove duplicates
+bio$Biomass_ha_11 <- ((((bio$a * (bio$SizeClass_11 ^ bio$b)) * bio$Abundance_11)/ bio$Area)/1000)* 10000
+## Add size classes together
+bio$Biomass_kgha <- bio$Biomass_ha + bio$Biomass_ha_11
+bio$Abundance <- bio$Abundance + bio$Abundance_11
+
+## Cleanup
+bio <- select(bio, - c("Transect","a", "b", "Area", "Biomass_ha_11", "Biomass_ha", "Abundance_11", "SizeClass_11", "SizeClass"))
+bio <- bio[bio$Biomass_kgha > 0,] 
+bio <- bio %>% drop_na(Biomass_kgha) #NB: there are NAs now, because the specieslist excel was outdated
+
+# Add abundance and biomass over size classes together
+bio <- aggregate(. ~ SurveyNo + Species + Diet + Observer, data = bio, FUN = sum) 
+
+```
+
+
